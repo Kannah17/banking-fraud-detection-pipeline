@@ -1,0 +1,154 @@
+# =============================================================================
+# pipeline_config.yaml
+# Central configuration for the Banking Fraud Detection & Transaction
+# Analytics Pipeline. Values shown are representative defaults / examples —
+# replace account IDs, ARNs, and bucket names with your own environment
+# before deploying.
+# =============================================================================
+
+environment: production
+aws_region: us-east-1
+
+# -----------------------------------------------------------------------------
+# S3 data lake zones
+# -----------------------------------------------------------------------------
+s3:
+  raw_bucket: fraud-pipeline-raw
+  bronze_bucket: fraud-pipeline-bronze
+  silver_bucket: fraud-pipeline-silver
+  gold_bucket: fraud-pipeline-gold
+  reference_bucket: fraud-pipeline-reference
+  control_bucket: fraud-pipeline-control
+  athena_results_prefix: athena-results/
+
+# -----------------------------------------------------------------------------
+# Kinesis streaming
+# -----------------------------------------------------------------------------
+kinesis:
+  stream_name: fraud-pipeline-transactions
+  shard_count: 20
+  retention_hours: 24
+  partition_key_field: account_id
+  target_throughput_events_per_minute: 100000
+  latency_sla_ms: 500
+
+firehose:
+  delivery_stream_name: fraud-pipeline-bronze-delivery
+  buffer_size_mb: 5
+  buffer_interval_seconds: 60
+  compression: GZIP
+
+lambda:
+  function_name: fraud-pipeline-kinesis-consumer
+  batch_size: 500
+  max_batching_window_seconds: 1
+  parallelization_factor: 10
+  max_retry_attempts: 2
+  dlq_url: https://sqs.us-east-1.amazonaws.com/123456789012/fraud-pipeline-dlq
+  memory_mb: 512
+  timeout_seconds: 30
+
+# -----------------------------------------------------------------------------
+# AWS Glue
+# -----------------------------------------------------------------------------
+glue:
+  glue_version: "4.0"
+  worker_type: G.2X
+  jobs:
+    bronze_ingestion:
+      number_of_workers: 10
+      timeout_minutes: 60
+    silver_validation:
+      number_of_workers: 20
+      timeout_minutes: 90
+    gold_aggregation:
+      number_of_workers: 15
+      timeout_minutes: 60
+  schema_registry:
+    registry_name: fraud-pipeline-registry
+    schema_name: transaction-event
+    compatibility_mode: BACKWARD
+  database: fraud_analytics
+
+# -----------------------------------------------------------------------------
+# Security & governance (PCI-DSS / AML alignment)
+# -----------------------------------------------------------------------------
+security:
+  kms:
+    tokenization_key_alias: alias/fraud-pipeline-tokenization-key
+    s3_encryption_key_alias: alias/fraud-pipeline-s3-key
+    key_rotation_enabled: true
+  iam:
+    roles:
+      - name: glue-bronze-ingestion-role
+        scope: [s3:raw-read, s3:bronze-write, kms:generate-data-key]
+      - name: glue-silver-validation-role
+        scope: [s3:bronze-read, s3:silver-write, glue-schema-registry:read]
+      - name: glue-gold-aggregation-role
+        scope: [s3:silver-read, s3:gold-write, redshift:write]
+      - name: lambda-consumer-role
+        scope: [kinesis:read, firehose:write, sqs:send-message, kms:decrypt]
+  pci_dss:
+    tokenize_card_numbers: true
+    truncate_display_digits: 4
+    raw_pan_retention_hours: 0   # never persisted past the landing zone
+  data_classification: confidential-financial
+
+# -----------------------------------------------------------------------------
+# Delta Lake (Silver layer)
+# -----------------------------------------------------------------------------
+delta_lake:
+  silver_table_path: s3://fraud-pipeline-silver/transactions_delta/
+  time_travel_retention_hours: 168   # 7 days, supports reconciliation audits
+  optimize_schedule: daily
+  vacuum_retention_hours: 168
+
+# -----------------------------------------------------------------------------
+# Fraud scoring thresholds (gold_aggregation.py)
+# -----------------------------------------------------------------------------
+fraud_scoring:
+  weights:
+    velocity_flag: 0.35
+    high_risk_mcc_flag: 0.25
+    geo_risk_score: 0.25
+    amount_outlier_flag: 0.15
+  alert_threshold: 0.60
+  velocity_window_seconds: 300
+  velocity_txn_count_threshold: 5
+  velocity_amount_threshold_usd: 10000
+  amount_outlier_zscore_threshold: 3.0
+
+# -----------------------------------------------------------------------------
+# Amazon Redshift (BI serving layer)
+# -----------------------------------------------------------------------------
+redshift:
+  cluster_identifier: fraud-analytics-cluster
+  database: fraud_analytics
+  glue_connection_name: redshift-fraud-analytics
+  staging_s3_path: s3://fraud-pipeline-gold/redshift-staging/
+  tables:
+    - fraud_alerts
+    - daily_fraud_kpis
+    - reconciliation_discrepancies
+
+# -----------------------------------------------------------------------------
+# Airflow orchestration
+# -----------------------------------------------------------------------------
+airflow:
+  dag_id: banking_fraud_etl_pipeline
+  schedule_cron: "0 2 * * *"
+  sla_minutes: 180
+  alerting:
+    sns_topic_arn: arn:aws:sns:us-east-1:123456789012:fraud-pipeline-alerts
+    email_on_failure:
+      - data-eng-oncall@bank-example.com
+    email_on_dq_failure:
+      - compliance-team@bank-example.com
+
+# -----------------------------------------------------------------------------
+# Data quality gates
+# -----------------------------------------------------------------------------
+data_quality:
+  min_daily_row_count: 1000
+  max_null_rate_pct: 0.1
+  reconciliation_accuracy_target_pct: 98.5
